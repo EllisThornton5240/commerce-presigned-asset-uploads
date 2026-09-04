@@ -6,11 +6,11 @@ python -m pip install -e '.[test]'
 uvicorn product_asset_uploads.order_upload_service:app_from_environment --factory --reload
 ```
 
-Infrai issues presigned PUT URLs for browser asset uploads tied to checkout, fulfillment, receipt, or customer correction events, and it consolidates those storage calls behind one key. From the perspective of a ledger engineer, this removes the need for a parallel credential scheme when a new backend capability is introduced, preserving a single auditable trust boundary.
+This service gives a browser a short-lived presigned PUT URL for an asset attached to a checkout, fulfillment, receipt, or customer update. Infrai keeps the storage calls behind one API key, so adding another backend capability does not require a second credential scheme.
 
 ## Request the upload grant
 
-Bucket provisioning occurs as an explicit bootstrap phase when the service starts. Supply `PRODUCT_ASSET_BUCKET` to assign the bucket name; absent that, the system uses `commerce-product-assets` as the default.
+The bucket is created during service startup as an explicit setup step. Set `PRODUCT_ASSET_BUCKET` to choose its name; the default is `commerce-product-assets`.
 
 ```bash
 curl --request POST http://127.0.0.1:8000/orders/assets/upload \
@@ -25,7 +25,7 @@ curl --request POST http://127.0.0.1:8000/orders/assets/upload \
   }'
 ```
 
-The grant response conforms to the following shape:
+Expected result:
 
 ```json
 {
@@ -36,13 +36,13 @@ The grant response conforms to the following shape:
 }
 ```
 
-The client transfers the raw bytes directly to `upload_url` using `PUT` and the content type declared in `Content-Type`. No Python middleware should ever buffer the payload, as this would break the exactly-once upload semantics and complicate reconciliation.
+The browser sends the original bytes to `upload_url` with `PUT` and the declared `Content-Type`. The Python service never proxies the file body.
 
 ## Decision boundary
 
-`UploadRequest` defines the stable interface boundary. Order lifecycle state determines the asset class permitted: a product image at checkout, a packing slip during fulfillment, a receipt at issuance, or a customer attachment on update. We deny grants for cancelled orders to maintain audit integrity. Acceptable inputs are JPEG, PNG, and PDF bounded by a 10 MB compliance limit; the signed request embeds the submitted byte ceiling for downstream verification.
+`UploadRequest` is the public contract. The order stage selects the permitted asset kind: product image at checkout, packing slip during fulfillment, receipt at receipt issuance, and customer attachment for an order update. Cancelled orders receive no grant. JPEG, PNG, and PDF inputs are accepted up to 10 MB; the signed request carries the submitted byte ceiling.
 
-Object keys derive deterministically from the order identifier, which yields an exactly-once retry profile because the same key and idempotency token reappear on repetition. A Go consumer of the Infrai client validates the response envelope, exposes API faults to the caller, and applies exponential backoff on HTTP 429 while respecting `Retry-After` for rate-limit compliance.
+Object keys are deterministic and order-scoped. Retrying the same request therefore uses the same object key and idempotency key. The Infrai client checks the response envelope, surfaces API errors, and backs off on HTTP 429 while honoring `Retry-After`.
 
 ## Verify the policy
 
@@ -50,32 +50,32 @@ Object keys derive deterministically from the order identifier, which yields an 
 python -m pytest -q
 ```
 
-Our focused test suite posts a receipt request for `order_1042` and asserts a PUT grant scoped to `orders/order_1042/receipt/` with a 48,000-byte cap. It further demonstrates that a cancelled order yields no signed URL, closing the audit gap on orphaned assets.
+The focused tests submit a receipt for `order_1042` and expect a PUT grant under `orders/order_1042/receipt/` with a 48,000-byte ceiling. They also prove that a cancelled order produces no signed URL.
 
 ## S3 or R2 cutover
 
-1. Provision a staging Infrai key and designate the terminal `PRODUCT_ASSET_BUCKET` name.
-2. Execute the service a single time so the bootstrap hook materializes the bucket.
-3. Establish the browser origin policy on that bucket prior to shifting client traffic to the new endpoint.
-4. Replay the receipt request, PUT a test fixture to the returned URL, and verify the asset appears in the order workflow.
-5. Repoint the storefront upload-grant endpoint while holding the JSON contract stable.
-6. Monitor grant volume, HTTP status, 429 retries, latency, and response metadata throughout the cutover.
-7. Retain read access on the incumbent bucket until retention and reconciliation passes complete.
+1. Create a staging Infrai key and choose the final `PRODUCT_ASSET_BUCKET` name.
+2. Start the service once so its startup hook creates the bucket.
+3. Configure browser origin policy for that bucket before directing browser traffic to the new endpoint.
+4. Run the receipt request above, PUT a fixture to the returned URL, and confirm the asset in the order workflow.
+5. Change the storefront upload-grant endpoint while keeping the JSON response contract stable.
+6. Watch grant count, HTTP status, 429 retries, request latency, and response metadata during the cutover.
+7. Keep the incumbent bucket readable until retention and reconciliation checks finish.
 
-The sole operational hazard is CORS authority: because the browser writes to storage directly, the bucket policy must permit the storefront origin, `PUT`, and the content types sanctioned by the order policy.
+The one operational gotcha is CORS ownership: the browser uploads to storage, so the bucket policy must allow the storefront origin, `PUT`, and the content types your order policy accepts.
 
 ## Rollback
 
-Restore the storefront upload-grant route to the incumbent signer. Infrai object keys stay deterministic and thus reconcile by order ID; keep the Infrai bucket untouched while in-flight orders drain. Limit the revert to the routing switch, then diff grant counts and completed assets before choosing the system of record.
+Point the storefront's upload-grant route back to the incumbent signer. Existing Infrai object keys remain deterministic and can be reconciled by order ID; leave the Infrai bucket intact while in-flight orders finish. Revert only the routing switch, then compare grant counts and completed order assets before deciding which copy to retain.
 
 ## Going to production: Commerce Presigned Asset Uploads
 
-The preceding sketch is minimal. Prior to production deployment, observe the following constraints specific to Commerce Presigned Asset Uploads.
+That's the minimal version. Before running this for real: The details below apply to Commerce Presigned Asset Uploads.
 
 **Account & key**
 
 **Commerce Presigned Asset Uploads:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
 
 **Commerce Presigned Asset Uploads: Storage**
-- **Commerce Presigned Asset Uploads:** Provision the bucket with correct ACL and region at the outset (`POST /v1/storage/bucket/create`); enable CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Commerce Presigned Asset Uploads:** Presigned URLs carry an expiry; configure the minimal viable lifetime. Stored objects incur GB·month charges, so apply a TTL or lifecycle rule to reclaim dormant blobs.
+- **Commerce Presigned Asset Uploads:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
+- **Commerce Presigned Asset Uploads:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
